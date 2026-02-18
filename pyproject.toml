@@ -1,17 +1,22 @@
 # pyproject.toml
 [project]
 name = "transcribing"
-version = "0.1.0"
-description = "CLI tool to transcribe audio files to SRT format using NeMo ASR"
+version = "0.2.0"
+description = "CLI tool to transcribe video files to SRT format using OpenAI Whisper large-v3"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "nemo_toolkit[asr]>=2.0.0",
-    "librosa>=0.10.0",
+    "transformers>=4.40.0",
+    "datasets[audio]>=2.18.0",
+    "accelerate>=0.27.0",
+    "torch>=2.0.0,<2.10",
     "soundfile>=0.12.0",
     "numpy>=1.23.0",
-    "torch>=2.0.0,<2.10",
-    "torchaudio>=2.0.0,<2.10",
 ]
 
 [project.scripts]
 transcribe = "main:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.1",
+]

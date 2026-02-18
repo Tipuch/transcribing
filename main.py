@@ -1,63 +1,97 @@
 #!/usr/bin/env python3
-"""CLI tool to transcribe an audio file to SRT format using NeMo ASR."""
+"""CLI tool to transcribe a video file to SRT format using OpenAI Whisper large-v3."""
 
 import argparse
 import logging
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
 
-def split_audio_into_chunks(audio_path, chunk_duration_sec=300):
+def extract_audio_from_video(video_path, output_audio_path):
     """
-    Split an audio file into chunks of the specified duration using soundfile.
+    Extract audio from a video file and convert to 16kHz mono WAV using ffmpeg.
 
-    Returns a list of Path objects pointing to the chunk files.
+    Args:
+        video_path: Path to the input video file.
+        output_audio_path: Path to write the extracted WAV audio.
     """
-    import soundfile as sf
-    import numpy as np
+    video_path = Path(video_path)
+    output_audio_path = Path(output_audio_path)
 
-    audio_path = Path(audio_path)
-    chunk_dir = audio_path.parent / f"{audio_path.stem}_chunks"
-    chunk_dir.mkdir(parents=True, exist_ok=True)
+    # Check that ffmpeg is available
+    if shutil.which("ffmpeg") is None:
+        logger.error(
+            "ffmpeg is required to extract audio from video files. "
+            "Install it with: sudo apt install ffmpeg  (or brew install ffmpeg on macOS)"
+        )
+        sys.exit(1)
 
-    info = sf.info(str(audio_path))
-    sample_rate = info.samplerate
-    total_frames = info.frames
-    chunk_frames = int(chunk_duration_sec * sample_rate)
+    logger.info(f"Extracting audio from video: {video_path}")
 
-    chunk_files = []
-    offset = 0
-    chunk_idx = 0
+    cmd = [
+        "ffmpeg",
+        "-i",
+        str(video_path),
+        "-vn",  # no video
+        "-acodec",
+        "pcm_s16le",  # 16-bit PCM
+        "-ar",
+        "16000",  # 16 kHz sample rate
+        "-ac",
+        "1",  # mono
+        "-y",  # overwrite output
+        str(output_audio_path),
+    ]
 
-    while offset < total_frames:
-        frames_to_read = min(chunk_frames, total_frames - offset)
-        data, sr = sf.read(str(audio_path), start=offset, frames=frames_to_read, dtype="int16")
-
-        chunk_path = chunk_dir / f"chunk_{chunk_idx:04d}.wav"
-        sf.write(str(chunk_path), data, sr, subtype="PCM_16")
-        chunk_files.append(chunk_path)
-
-        offset += frames_to_read
-        chunk_idx += 1
-
-    logger.info(f"Split audio into {len(chunk_files)} chunks of ~{chunk_duration_sec}s each")
-    return chunk_files
+    try:
+        subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        logger.info(f"Audio extracted to {output_audio_path}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"ffmpeg failed:\n{e.stderr.decode()}")
+        sys.exit(1)
 
 
-def format_srt(segments):
-    """Format a list of segment dicts (with 'start', 'end', 'segment') into SRT content."""
+def format_srt(chunks):
+    """
+    Format a list of chunk dicts into SRT content.
+
+    Each chunk has the shape:
+        {"timestamp": (start_seconds, end_seconds), "text": "..."}
+    """
     lines = []
+    index = 0
 
-    for i, seg in enumerate(segments, start=1):
-        start_ts = _seconds_to_srt_timestamp(seg["start"])
-        end_ts = _seconds_to_srt_timestamp(seg["end"])
-        text = seg.get("segment", "").strip()
-        lines.append(str(i))
+    for chunk in chunks:
+        start_sec, end_sec = chunk["timestamp"]
+
+        # Whisper may return None for the last end timestamp; fall back to start + 5s
+        if start_sec is None:
+            start_sec = 0.0
+        if end_sec is None:
+            end_sec = start_sec + 5.0
+
+        text = chunk.get("text", "").strip()
+        if not text:
+            continue
+
+        index += 1
+        start_ts = _seconds_to_srt_timestamp(start_sec)
+        end_ts = _seconds_to_srt_timestamp(end_sec)
+
+        lines.append(str(index))
         lines.append(f"{start_ts} --> {end_ts}")
         lines.append(text)
         lines.append("")
@@ -74,124 +108,186 @@ def _seconds_to_srt_timestamp(seconds):
     return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 
-def transcribe_audio(audio_path):
+def transcribe_video(video_path, language=None, task="transcribe"):
     """
-    Transcribe an audio file to SRT format using NeMo ASR.
+    Transcribe a video file to SRT format using OpenAI Whisper large-v3.
+
+    Uses model.generate() directly so that Whisper's own long-form
+    sequential chunking mechanism handles audio of arbitrary length
+    (see Whisper paper §3.8).
 
     Steps:
-    1. Ensure audio is 16kHz mono WAV (convert if needed)
-    2. Split audio into manageable chunks (for 8GB VRAM)
-    3. Load NeMo model with long-form audio configuration
-    4. Transcribe each chunk with segment timestamps
-    5. Merge results and generate SRT file
+    1. Extract audio from video as 16kHz mono WAV via ffmpeg
+    2. Load Whisper large-v3 model from Hugging Face
+    3. Build full mel-spectrogram features (no truncation)
+    4. Call model.generate() with return_timestamps / return_segments
+    5. Decode segments and generate SRT file
     6. Clean up temporary audio files
     """
-    audio_path = Path(audio_path)
+    video_path = Path(video_path)
 
-    if not audio_path.exists():
-        logger.error(f"Audio file not found: {audio_path}")
+    if not video_path.exists():
+        logger.error(f"Video file not found: {video_path}")
         sys.exit(1)
 
-    audio_stem = audio_path.stem
+    video_stem = video_path.stem
 
     # Create directories if needed
     os.makedirs("processing", exist_ok=True)
     os.makedirs("captions", exist_ok=True)
 
-    # We may need a resampled/converted copy if the input isn't 16kHz mono WAV
-    converted_audio_path = Path(f"processing/{audio_stem}_converted.wav")
-    output_srt_path = Path(f"captions/{audio_stem}.srt")
-    chunk_dir = None
-    needs_conversion = False
+    extracted_audio_path = Path(f"processing/{video_stem}_audio.wav")
+    output_srt_path = Path(f"captions/{video_stem}.srt")
 
     try:
-        # Check if we need to convert the audio to 16kHz mono PCM WAV
-        import soundfile as sf
+        # -----------------------------------------------------------------
+        # Step 1: Extract audio from video
+        # -----------------------------------------------------------------
+        extract_audio_from_video(video_path, extracted_audio_path)
 
-        working_audio_path = audio_path
-
-        try:
-            info = sf.info(str(audio_path))
-            if info.samplerate != 16000 or info.channels != 1:
-                needs_conversion = True
-                logger.info(
-                    f"Audio is {info.samplerate}Hz, {info.channels}ch — converting to 16kHz mono WAV"
-                )
-        except Exception:
-            # If soundfile can't read it directly, try converting with librosa
-            needs_conversion = True
-            logger.info("Audio format not directly readable by soundfile — converting to 16kHz mono WAV")
-
-        if needs_conversion:
-            _convert_audio_to_16khz_mono(audio_path, converted_audio_path)
-            working_audio_path = converted_audio_path
-
-        # Step 2: Split audio into chunks (5 minutes each for 8GB VRAM)
-        logger.info("Splitting audio into chunks for memory-efficient processing...")
-        chunk_files = split_audio_into_chunks(working_audio_path, chunk_duration_sec=300)
-
-        if not chunk_files:
-            logger.error("Failed to create audio chunks")
-            sys.exit(1)
-
-        chunk_dir = chunk_files[0].parent
-
-        # Step 3: Load NeMo model
-        logger.info("Loading NeMo ASR model (this may take a moment)...")
-
-        # Disable strict protobuf version checking to work around version mismatch
-        os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
+        # -----------------------------------------------------------------
+        # Step 2: Load Whisper large-v3 model
+        # -----------------------------------------------------------------
+        logger.info("Loading Whisper large-v3 model (this may take a moment)...")
 
         # Enable memory-efficient CUDA allocator to reduce fragmentation
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
-        import nemo.collections.asr as nemo_asr
+        import torch
+        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
-        asr_model = nemo_asr.models.ASRModel.from_pretrained(
-            model_name="nvidia/parakeet-tdt-0.6b-v3"
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+        logger.info(f"Using device: {device}  dtype: {torch_dtype}")
+
+        model_id = "openai/whisper-large-v3"
+
+        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+            model_id,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+            use_safetensors=True,
+        )
+        model.to(device)
+
+        processor = AutoProcessor.from_pretrained(model_id)
+
+        # -----------------------------------------------------------------
+        # Step 3: Load audio and build full mel-spectrogram features
+        # -----------------------------------------------------------------
+        logger.info("Loading audio and computing mel-spectrogram features...")
+
+        import soundfile as sf
+
+        audio_array, sr = sf.read(str(extracted_audio_path), dtype="float32")
+
+        # Convert stereo to mono if needed (ffmpeg should already output mono,
+        # but guard against unexpected formats)
+        if len(audio_array.shape) > 1:
+            audio_array = audio_array.mean(axis=1)
+
+        duration_sec = len(audio_array) / sr
+        logger.info(f"Audio duration: {duration_sec:.1f}s  sample rate: {sr}Hz")
+
+        # Build features WITHOUT truncation so the full spectrogram is kept.
+        # Whisper's generate() detects inputs > 30 s and automatically
+        # enters long-form sequential decoding mode.
+        inputs = processor.feature_extractor(
+            audio_array,
+            sampling_rate=sr,
+            return_tensors="pt",
+            truncation=False,
+            padding="longest",
+            return_attention_mask=True,
         )
 
-        # Configure for long-form audio with memory optimization (8GB VRAM target: ~6-7GB usage)
-        asr_model.change_attention_model(
-            self_attention_model="rel_pos_local_attn",
-            att_context_size=[256, 256],
+        input_features = inputs.input_features.to(device, dtype=torch_dtype)
+        attention_mask = inputs.attention_mask.to(device)
+
+        # -----------------------------------------------------------------
+        # Step 4: Transcribe with model.generate()
+        # -----------------------------------------------------------------
+        logger.info("Transcribing audio (this may take a while for long videos)...")
+
+        generate_kwargs = {
+            # Whisper long-form heuristics (paper §4.5)
+            "condition_on_prev_tokens": True,
+            "compression_ratio_threshold": 1.35,
+            "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+            "logprob_threshold": -1.0,
+            "no_speech_threshold": 0.6,
+            # Timestamps & segments
+            "return_timestamps": True,
+            "return_segments": True,
+            "num_beams": 1,
+            # Do NOT set max_new_tokens — Whisper's long-form sequential
+            # decoding adjusts it dynamically per segment to account for
+            # the variable-length decoder_input_ids (start tokens +
+            # previous-segment prompt tokens).
+        }
+
+        if language is not None:
+            generate_kwargs["language"] = language
+            logger.info(f"Forcing source language: {language}")
+
+        if task == "translate":
+            generate_kwargs["task"] = "translate"
+            logger.info("Task: translate (target language is English)")
+        else:
+            generate_kwargs["task"] = "transcribe"
+
+        outputs = model.generate(
+            input_features=input_features,
+            attention_mask=attention_mask,
+            **generate_kwargs,
         )
 
-        # Enable auto-chunking of subsampling for processing long audio files piece-by-piece
-        asr_model.change_subsampling_conv_chunking_factor(1)
+        # -----------------------------------------------------------------
+        # Step 5: Extract segments and build SRT
+        # -----------------------------------------------------------------
+        chunks = []
 
-        # Disable CUDA graphs to avoid CUDA 12.8 API incompatibility (GitHub issue #15340)
-        # Must configure BEFORE transcription since transcribe() reinitializes the decoder
-        from omegaconf import open_dict
-        with open_dict(asr_model.cfg.decoding):
-            asr_model.cfg.decoding.greedy.use_cuda_graph_decoder = False
-        logger.info("Configured decoder to disable CUDA graphs")
+        if isinstance(outputs, dict) and "segments" in outputs:
+            # return_segments=True  →  outputs["segments"] is a list
+            # (one entry per batch item) of lists of segment dicts.
+            all_segments = outputs["segments"][0]  # single-item batch
+            logger.info(f"Received {len(all_segments)} segments from Whisper")
 
-        # Step 4: Transcribe each chunk with timestamps
-        logger.info(f"Transcribing {len(chunk_files)} audio chunks (this may take a while)...")
-        all_segments = []
-        cumulative_time_offset = 0.0
+            for seg in all_segments:
+                text = processor.decode(seg["tokens"], skip_special_tokens=True).strip()
+                if text:
+                    chunks.append(
+                        {
+                            "timestamp": (float(seg["start"]), float(seg["end"])),
+                            "text": text,
+                        }
+                    )
+        else:
+            # Fallback: no structured segments, decode the full sequence
+            logger.warning("No structured segments returned; decoding full output")
+            token_ids = (
+                outputs if not isinstance(outputs, dict) else outputs["sequences"]
+            )
+            full_text = processor.batch_decode(token_ids, skip_special_tokens=True)[
+                0
+            ].strip()
+            if full_text:
+                chunks.append(
+                    {
+                        "timestamp": (0.0, duration_sec),
+                        "text": full_text,
+                    }
+                )
 
-        for i, chunk_path in enumerate(chunk_files):
-            logger.info(f"Processing chunk {i + 1}/{len(chunk_files)}: {chunk_path.name}")
+        logger.info(f"Generating SRT file from {len(chunks)} subtitle entries...")
 
-            output = asr_model.transcribe([str(chunk_path)], timestamps=True, batch_size=1)
-            chunk_segments = output[0].timestamp["segment"]
+        if not chunks:
+            logger.warning("No speech detected in the audio")
+            srt_content = ""
+        else:
+            srt_content = format_srt(chunks)
 
-            # Adjust timestamps to account for chunk position in original audio
-            for segment in chunk_segments:
-                segment["start"] += cumulative_time_offset
-                segment["end"] += cumulative_time_offset
-                all_segments.append(segment)
-
-            # Update offset for next chunk (5 minutes = 300 seconds)
-            cumulative_time_offset += 300.0
-
-        # Step 5: Generate SRT
-        logger.info(f"Generating SRT file from {len(all_segments)} segments...")
-        srt_content = format_srt(all_segments)
-
-        # Write to file
         with open(output_srt_path, "w", encoding="utf-8") as f:
             f.write(srt_content)
 
@@ -202,56 +298,52 @@ def transcribe_audio(audio_path):
         raise
 
     finally:
-        # Step 6: Clean up temporary files
-        if chunk_dir and chunk_dir.exists():
-            logger.info("Cleaning up audio chunks")
-            shutil.rmtree(chunk_dir)
-
-        if converted_audio_path.exists():
-            logger.info("Cleaning up converted audio file")
-            converted_audio_path.unlink()
+        # -----------------------------------------------------------------
+        # Step 6: Clean up temporary audio
+        # -----------------------------------------------------------------
+        if extracted_audio_path.exists():
+            logger.info("Cleaning up extracted audio file")
+            extracted_audio_path.unlink()
 
     return str(output_srt_path)
 
 
-def _convert_audio_to_16khz_mono(input_path, output_path):
-    """Convert an audio file to 16kHz mono WAV using librosa and soundfile."""
-    import numpy as np
-
-    try:
-        import librosa
-
-        logger.info(f"Loading audio with librosa: {input_path}")
-        # librosa.load automatically resamples to the target sr and converts to mono
-        audio_data, sr = librosa.load(str(input_path), sr=16000, mono=True)
-
-        import soundfile as sf
-
-        # Convert float32 [-1, 1] to int16
-        audio_int16 = (audio_data * 32767).astype(np.int16)
-        sf.write(str(output_path), audio_int16, 16000, subtype="PCM_16")
-        logger.info(f"Converted audio saved to {output_path}")
-
-    except ImportError:
-        logger.error(
-            "librosa is required for audio format conversion. "
-            "Install it with: pip install librosa"
-        )
-        sys.exit(1)
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="Transcribe an audio file to SRT format using NeMo ASR.",
+        description="Transcribe a video file to SRT format using OpenAI Whisper large-v3.",
     )
     parser.add_argument(
         "file_path",
         type=str,
-        help="Path to the audio file to transcribe.",
+        help="Path to the video file to transcribe.",
+    )
+    parser.add_argument(
+        "--language",
+        type=str,
+        default=None,
+        help=(
+            "Source audio language (e.g. 'english', 'french'). "
+            "If omitted, Whisper auto-detects the language."
+        ),
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        choices=["transcribe", "translate"],
+        default="transcribe",
+        help=(
+            "'transcribe' keeps the original language; "
+            "'translate' translates everything into English. "
+            "Default: transcribe."
+        ),
     )
     args = parser.parse_args()
 
-    result = transcribe_audio(args.file_path)
+    result = transcribe_video(
+        args.file_path,
+        language=args.language,
+        task=args.task,
+    )
     if result:
         print(f"Transcription complete: {result}")
 
