@@ -14,6 +14,8 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+CHUNK_DURATION_SEC = 120  # 2 minutes per chunk
+
 
 def extract_audio_from_video(video_path, output_audio_path):
     """
@@ -26,7 +28,6 @@ def extract_audio_from_video(video_path, output_audio_path):
     video_path = Path(video_path)
     output_audio_path = Path(output_audio_path)
 
-    # Check that ffmpeg is available
     if shutil.which("ffmpeg") is None:
         logger.error(
             "ffmpeg is required to extract audio from video files. "
@@ -40,14 +41,14 @@ def extract_audio_from_video(video_path, output_audio_path):
         "ffmpeg",
         "-i",
         str(video_path),
-        "-vn",  # no video
+        "-vn",
         "-acodec",
-        "pcm_s16le",  # 16-bit PCM
+        "pcm_s16le",
         "-ar",
-        "16000",  # 16 kHz sample rate
+        "16000",
         "-ac",
-        "1",  # mono
-        "-y",  # overwrite output
+        "1",
+        "-y",
         str(output_audio_path),
     ]
 
@@ -64,6 +65,154 @@ def extract_audio_from_video(video_path, output_audio_path):
         sys.exit(1)
 
 
+def get_audio_duration(audio_path):
+    """Get the duration of an audio file in seconds using ffprobe."""
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ]
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+        )
+        return float(result.stdout.decode().strip())
+    except (subprocess.CalledProcessError, ValueError) as e:
+        logger.error(f"ffprobe failed: {e}")
+        sys.exit(1)
+
+
+def split_audio_into_chunks(audio_path, chunk_duration_sec, output_dir):
+    """
+    Split an audio file into fixed-length chunks using ffmpeg.
+
+    Returns a list of (chunk_path, offset_seconds) tuples.
+    """
+    total_duration = get_audio_duration(audio_path)
+    audio_path = Path(audio_path)
+    output_dir = Path(output_dir)
+    chunk_paths = []
+
+    start = 0.0
+    chunk_index = 0
+
+    while start < total_duration:
+        chunk_path = output_dir / f"{audio_path.stem}_chunk{chunk_index:04d}.wav"
+        cmd = [
+            "ffmpeg",
+            "-i",
+            str(audio_path),
+            "-ss",
+            str(start),
+            "-t",
+            str(chunk_duration_sec),
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-y",
+            str(chunk_path),
+        ]
+        try:
+            subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
+            )
+        except subprocess.CalledProcessError as e:
+            logger.error(f"ffmpeg chunk split failed:\n{e.stderr.decode()}")
+            sys.exit(1)
+
+        chunk_paths.append((chunk_path, start))
+        logger.info(
+            f"  Chunk {chunk_index}: {start:.1f}s – {min(start + chunk_duration_sec, total_duration):.1f}s"
+        )
+        start += chunk_duration_sec
+        chunk_index += 1
+
+    logger.info(
+        f"Split audio into {len(chunk_paths)} chunk(s) of up to {chunk_duration_sec}s each"
+    )
+    return chunk_paths
+
+
+def transcribe_chunk(audio_path, processor, model, device, torch_dtype, language, task):
+    """
+    Transcribe a single audio chunk and return a list of segment dicts
+    with keys 'start', 'end', 'text' (timestamps relative to chunk start).
+    """
+    import soundfile as sf
+
+    audio_array, sr = sf.read(str(audio_path), dtype="float32")
+
+    if len(audio_array.shape) > 1:
+        audio_array = audio_array.mean(axis=1)
+
+    inputs = processor.feature_extractor(
+        audio_array,
+        sampling_rate=sr,
+        return_tensors="pt",
+        truncation=False,
+        padding="longest",
+        return_attention_mask=True,
+    )
+
+    input_features = inputs.input_features.to(device, dtype=torch_dtype)
+    attention_mask = inputs.attention_mask.to(device)
+
+    generate_kwargs = {
+        "return_timestamps": True,
+        "return_segments": True,
+    }
+
+    if language is not None:
+        generate_kwargs["language"] = language
+    generate_kwargs["task"] = task
+
+    outputs = model.generate(
+        input_features=input_features,
+        attention_mask=attention_mask,
+        **generate_kwargs,
+    )
+
+    segments = []
+    chunk_duration = len(audio_array) / sr
+
+    if isinstance(outputs, dict) and "segments" in outputs:
+        all_segments = outputs["segments"][0]  # single-item batch
+        for seg in all_segments:
+            text = processor.decode(seg["tokens"], skip_special_tokens=True).strip()
+            if text:
+                segments.append(
+                    {
+                        "start": float(seg["start"]),
+                        "end": float(seg["end"]),
+                        "text": text,
+                    }
+                )
+    else:
+        # Fallback: no structured segments
+        token_ids = outputs if not isinstance(outputs, dict) else outputs["sequences"]
+        full_text = processor.batch_decode(token_ids, skip_special_tokens=True)[
+            0
+        ].strip()
+        if full_text:
+            segments.append(
+                {
+                    "start": 0.0,
+                    "end": chunk_duration,
+                    "text": full_text,
+                }
+            )
+
+    return segments
+
+
 def format_srt(chunks):
     """
     Format a list of chunk dicts into SRT content.
@@ -77,7 +226,6 @@ def format_srt(chunks):
     for chunk in chunks:
         start_sec, end_sec = chunk["timestamp"]
 
-        # Whisper may return None for the last end timestamp; fall back to start + 5s
         if start_sec is None:
             start_sec = 0.0
         if end_sec is None:
@@ -112,17 +260,13 @@ def transcribe_video(video_path, language=None, task="transcribe"):
     """
     Transcribe a video file to SRT format using OpenAI Whisper large-v3.
 
-    Uses model.generate() directly so that Whisper's own long-form
-    sequential chunking mechanism handles audio of arbitrary length
-    (see Whisper paper §3.8).
-
     Steps:
     1. Extract audio from video as 16kHz mono WAV via ffmpeg
-    2. Load Whisper large-v3 model from Hugging Face
-    3. Build full mel-spectrogram features (no truncation)
-    4. Call model.generate() with return_timestamps / return_segments
-    5. Decode segments and generate SRT file
-    6. Clean up temporary audio files
+    2. Split audio into 2-minute chunks
+    3. Load Whisper large-v3 model from Hugging Face
+    4. Transcribe each chunk, offsetting timestamps
+    5. Combine segments and generate SRT file
+    6. Clean up temporary files
     """
     video_path = Path(video_path)
 
@@ -132,25 +276,26 @@ def transcribe_video(video_path, language=None, task="transcribe"):
 
     video_stem = video_path.stem
 
-    # Create directories if needed
     os.makedirs("processing", exist_ok=True)
     os.makedirs("captions", exist_ok=True)
 
     extracted_audio_path = Path(f"processing/{video_stem}_audio.wav")
     output_srt_path = Path(f"captions/{video_stem}.srt")
+    chunk_paths = []
 
     try:
-        # -----------------------------------------------------------------
-        # Step 1: Extract audio from video
-        # -----------------------------------------------------------------
+        # Step 1 ─ Extract audio
         extract_audio_from_video(video_path, extracted_audio_path)
 
-        # -----------------------------------------------------------------
-        # Step 2: Load Whisper large-v3 model
-        # -----------------------------------------------------------------
+        # Step 2 ─ Split into 2-minute chunks
+        logger.info(f"Splitting audio into {CHUNK_DURATION_SEC}s chunks...")
+        chunk_paths = split_audio_into_chunks(
+            extracted_audio_path, CHUNK_DURATION_SEC, "processing"
+        )
+
+        # Step 3 ─ Load model
         logger.info("Loading Whisper large-v3 model (this may take a moment)...")
 
-        # Enable memory-efficient CUDA allocator to reduce fragmentation
         os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
         import torch
@@ -173,120 +318,37 @@ def transcribe_video(video_path, language=None, task="transcribe"):
 
         processor = AutoProcessor.from_pretrained(model_id)
 
-        # -----------------------------------------------------------------
-        # Step 3: Load audio and build full mel-spectrogram features
-        # -----------------------------------------------------------------
-        logger.info("Loading audio and computing mel-spectrogram features...")
+        # Step 4 ─ Transcribe each chunk
+        all_chunks = []
 
-        import soundfile as sf
-
-        audio_array, sr = sf.read(str(extracted_audio_path), dtype="float32")
-
-        # Convert stereo to mono if needed (ffmpeg should already output mono,
-        # but guard against unexpected formats)
-        if len(audio_array.shape) > 1:
-            audio_array = audio_array.mean(axis=1)
-
-        duration_sec = len(audio_array) / sr
-        logger.info(f"Audio duration: {duration_sec:.1f}s  sample rate: {sr}Hz")
-
-        # Build features WITHOUT truncation so the full spectrogram is kept.
-        # Whisper's generate() detects inputs > 30 s and automatically
-        # enters long-form sequential decoding mode.
-        inputs = processor.feature_extractor(
-            audio_array,
-            sampling_rate=sr,
-            return_tensors="pt",
-            truncation=False,
-            padding="longest",
-            return_attention_mask=True,
-        )
-
-        input_features = inputs.input_features.to(device, dtype=torch_dtype)
-        attention_mask = inputs.attention_mask.to(device)
-
-        # -----------------------------------------------------------------
-        # Step 4: Transcribe with model.generate()
-        # -----------------------------------------------------------------
-        logger.info("Transcribing audio (this may take a while for long videos)...")
-
-        generate_kwargs = {
-            # Whisper long-form heuristics (paper §4.5)
-            "condition_on_prev_tokens": True,
-            "compression_ratio_threshold": 1.35,
-            "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
-            "logprob_threshold": -1.0,
-            "no_speech_threshold": 0.6,
-            # Timestamps & segments
-            "return_timestamps": True,
-            "return_segments": True,
-            "num_beams": 1,
-            # Do NOT set max_new_tokens — Whisper's long-form sequential
-            # decoding adjusts it dynamically per segment to account for
-            # the variable-length decoder_input_ids (start tokens +
-            # previous-segment prompt tokens).
-        }
-
-        if language is not None:
-            generate_kwargs["language"] = language
-            logger.info(f"Forcing source language: {language}")
-
-        if task == "translate":
-            generate_kwargs["task"] = "translate"
-            logger.info("Task: translate (target language is English)")
-        else:
-            generate_kwargs["task"] = "transcribe"
-
-        outputs = model.generate(
-            input_features=input_features,
-            attention_mask=attention_mask,
-            **generate_kwargs,
-        )
-
-        # -----------------------------------------------------------------
-        # Step 5: Extract segments and build SRT
-        # -----------------------------------------------------------------
-        chunks = []
-
-        if isinstance(outputs, dict) and "segments" in outputs:
-            # return_segments=True  →  outputs["segments"] is a list
-            # (one entry per batch item) of lists of segment dicts.
-            all_segments = outputs["segments"][0]  # single-item batch
-            logger.info(f"Received {len(all_segments)} segments from Whisper")
-
-            for seg in all_segments:
-                text = processor.decode(seg["tokens"], skip_special_tokens=True).strip()
-                if text:
-                    chunks.append(
-                        {
-                            "timestamp": (float(seg["start"]), float(seg["end"])),
-                            "text": text,
-                        }
-                    )
-        else:
-            # Fallback: no structured segments, decode the full sequence
-            logger.warning("No structured segments returned; decoding full output")
-            token_ids = (
-                outputs if not isinstance(outputs, dict) else outputs["sequences"]
+        for i, (chunk_path, offset) in enumerate(chunk_paths):
+            logger.info(
+                f"Transcribing chunk {i + 1}/{len(chunk_paths)} "
+                f"(offset {offset:.1f}s)..."
             )
-            full_text = processor.batch_decode(token_ids, skip_special_tokens=True)[
-                0
-            ].strip()
-            if full_text:
-                chunks.append(
+
+            segments = transcribe_chunk(
+                chunk_path, processor, model, device, torch_dtype, language, task
+            )
+
+            logger.info(f"  → {len(segments)} segment(s) from chunk {i + 1}")
+
+            for seg in segments:
+                all_chunks.append(
                     {
-                        "timestamp": (0.0, duration_sec),
-                        "text": full_text,
+                        "timestamp": (seg["start"] + offset, seg["end"] + offset),
+                        "text": seg["text"],
                     }
                 )
 
-        logger.info(f"Generating SRT file from {len(chunks)} subtitle entries...")
+        # Step 5 ─ Build SRT
+        logger.info(f"Generating SRT file from {len(all_chunks)} subtitle entries...")
 
-        if not chunks:
+        if not all_chunks:
             logger.warning("No speech detected in the audio")
             srt_content = ""
         else:
-            srt_content = format_srt(chunks)
+            srt_content = format_srt(all_chunks)
 
         with open(output_srt_path, "w", encoding="utf-8") as f:
             f.write(srt_content)
@@ -298,11 +360,12 @@ def transcribe_video(video_path, language=None, task="transcribe"):
         raise
 
     finally:
-        # -----------------------------------------------------------------
-        # Step 6: Clean up temporary audio
-        # -----------------------------------------------------------------
+        # Step 6 ─ Clean up
+        for chunk_path, _ in chunk_paths:
+            if Path(chunk_path).exists():
+                Path(chunk_path).unlink()
         if extracted_audio_path.exists():
-            logger.info("Cleaning up extracted audio file")
+            logger.info("Cleaning up temporary audio files")
             extracted_audio_path.unlink()
 
     return str(output_srt_path)
